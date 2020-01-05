@@ -2167,6 +2167,81 @@ augroup END
 
 " Section: :Git
 
+function! s:Checktime() abort
+  silent checktime
+endfunction
+
+function! s:JobReceive(state, job, data, ...) abort
+  let data = type(a:data) == type([]) ? join(a:data, "\n") : a:data
+  if has_key(a:state, 'buffer')
+    let data = remove(a:state, 'buffer') . data
+  endif
+  let escape = "\033]51;[^\007]*"
+  let a:state.buffer = matchstr(data, escape . "$\\|\n$")
+  if len(a:state.buffer)
+    let data = strpart(data, 0, len(data) - len(a:state.buffer))
+  endif
+  let cmd = matchstr(data, escape . "\007")[5:-2]
+  let data = substitute(data, escape . "\007", '', 'g')
+  echon data
+  if cmd =~# '^split '
+    let a:state.file = strpart(cmd, 6)
+  endif
+endfunction
+
+function! s:JobEdit(state, job, file, ...) abort
+  exe '-tabedit' s:fnameescape(a:file)
+  set bufhidden=wipe
+  let s:edit_jobs[bufnr('')] = [a:state, a:job]
+endfunction
+
+if !exists('s:edit_jobs')
+  let s:edit_jobs = {}
+endif
+function! s:JobWait(state, job, bufdeleted) abort
+  while !has_key(a:state, 'file') && ch_status(a:job) !=# 'closed'
+    sleep 1m
+    if getchar(1) > 0
+      let c = getchar()
+      call ch_sendraw(a:job, type(c) == type(0) ? nr2char(c) : c)
+    endif
+  endwhile
+  if has_key(a:state, 'file')
+    let file = remove(a:state, 'file')
+    echo
+    if a:bufdeleted
+      let s:continue = function('s:JobEdit', [a:state, a:job, file, 0])
+    else
+      call s:JobEdit(a:state, a:job, file, 0)
+    endif
+  else
+    call fugitive#ReloadStatus(a:state.dir, 1)
+    call timer_start(0, {t -> s:Checktime() })
+  endif
+  return ''
+endfunction
+
+function! s:JobBufDelete(bufnr) abort
+  if has_key(s:edit_jobs, a:bufnr) |
+    let s:edit_jobs[a:bufnr][0].buffer .= "\n" |
+    call ch_sendraw(s:edit_jobs[a:bufnr][1], "0\n") |
+    call call('s:JobWait', remove(s:edit_jobs, a:bufnr) + [1]) |
+  endif
+endfunction
+
+augroup fugitive_job
+  autocmd!
+  autocmd BufDelete * call s:JobBufDelete(expand('<abuf>'))
+  autocmd BufEnter * nested
+        \ if exists('s:continue') |
+        \   call call(remove(s:, 'continue'), []) |
+        \ endif
+  autocmd VimLeave *
+        \ for s:jobbuf in keys(s:edit_jobs) |
+        \   call ch_sendraw(remove(s:edit_jobs, s:jobbuf)[1], "1\n") |
+        \ endfor
+augroup END
+
 function! fugitive#Command(line1, line2, range, bang, mods, arg) abort
   let dir = s:Dir()
   let [args, after] = s:SplitExpandChain(a:arg, s:Tree(dir))
@@ -2181,7 +2256,7 @@ function! fugitive#Command(line1, line2, range, bang, mods, arg) abort
     call extend(args, split(alias, '\s\+'), 'keep')
   endif
   let name = substitute(args[0], '\%(^\|-\)\(\l\)', '\u\1', 'g')
-  if exists('*s:' . name . 'Subcommand') && get(args, 1, '') !=# '--help'
+  if exists('*s:' . name . 'Subcommand') && get(args, 1, '') !=# '--help' && (!exists('*job_start') || name !~# '^\%(Rebase\|Merge\|Pull\|Commit\|Revert\)$')
     try
       exe s:DirCheck(dir)
       let result = s:{name}Subcommand(a:line1, a:line2, a:range, a:bang, a:mods, args[1:-1])
@@ -2210,16 +2285,31 @@ function! fugitive#Command(line1, line2, range, bang, mods, arg) abort
       return 'exe ' . string(mods . 'terminal ' . (a:line2 ? '' : '++curwin ') . join(map(s:UserCommandList(dir) + args, 's:fnameescape(v:val)'))) . assign . after
     endif
   endif
-  if has('gui_running') && !has('win32')
-    call insert(args, '--no-pager')
+  if exists('*job_start')
+    let editor = 'sh ' . s:TempScript('printf "\033]51;split %s\007" "$*"', 'exit $(head -1)')
+    let [_, env, argv] = fugitive#PrepareDirEnvArgv([dir, '-c', 'core.editor=' . editor, '-c', 'sequence.editor=' . editor])
+    let state = {'dir': dir}
+    if &autowrite || &autowriteall | silent! wall | endif
+    let job = job_start(s:UserCommandList(dir) + argv + args, {
+          \ 'mode': 'raw',
+          \ 'env': env,
+          \ 'out_cb': function('s:JobReceive', [state]),
+          \ 'err_cb': function('s:JobReceive', [state]),
+          \ })
+    call s:JobWait(state, job, 0)
+    return after[1:-1]
+  else
+    if has('gui_running') && !has('win32')
+      call insert(args, '--no-pager')
+    endif
+    let pre = ''
+    if has('nvim') && executable('env')
+      let pre .= 'env GIT_TERMINAL_PROMPT=0 '
+    endif
+    return 'exe ' . string('noautocmd !' . escape(pre . s:UserCommand(dir, args), '!#%')) .
+          \ '|call fugitive#ReloadStatus(' . string(dir) . ', 1)' .
+          \ after
   endif
-  let pre = ''
-  if has('nvim') && executable('env')
-    let pre .= 'env GIT_TERMINAL_PROMPT=0 '
-  endif
-  return 'exe ' . string('noautocmd !' . escape(pre . s:UserCommand(dir, args), '!#%')) .
-        \ '|call fugitive#ReloadStatus(' . string(dir) . ', 1)' .
-        \ after
 endfunction
 
 let s:exec_paths = {}
