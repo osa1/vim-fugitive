@@ -2190,7 +2190,7 @@ function! s:JobReceive(state, job, data, ...) abort
 endfunction
 
 function! s:JobEdit(state, job, file, ...) abort
-  exe '-tabedit' s:fnameescape(a:file)
+  exe 'split' s:fnameescape(a:file)
   set bufhidden=wipe
   let s:edit_jobs[bufnr('')] = [a:state, a:job]
 endfunction
@@ -2232,10 +2232,26 @@ endfunction
 augroup fugitive_job
   autocmd!
   autocmd BufDelete * call s:JobBufDelete(expand('<abuf>'))
-  autocmd BufEnter * nested
-        \ if exists('s:continue') |
-        \   call call(remove(s:, 'continue'), []) |
-        \ endif
+  if has('patch-8.1.2044')
+    autocmd SafeState * nested
+          \ if exists('s:continue') |
+          \   call call(remove(s:, 'continue'), []) |
+          \ endif
+  elseif has('patch-8.1.1756')
+    if &updatetime == 4000
+      set updatetime=100
+    endif
+    autocmd CursorHold * nested
+          \ if exists('s:continue') |
+          \   call call(remove(s:, 'continue'), []) |
+          \ endif
+  else
+    autocmd BufEnter * nested
+          \ if exists('s:continue') |
+          \   let g:bufenter = [expand('<amatch>'), winnr('$')] |
+          \   call call(remove(s:, 'continue'), []) |
+          \ endif
+  endif
   autocmd VimLeave *
         \ for s:jobbuf in keys(s:edit_jobs) |
         \   call ch_sendraw(remove(s:edit_jobs, s:jobbuf)[1], "1\n") |
